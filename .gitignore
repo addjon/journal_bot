@@ -2,4 +2,4 @@
 .env.save
 *.db
 journal-bot-436918-64764ca2b0c5.json
-
+app.log

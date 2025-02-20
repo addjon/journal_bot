@@ -478,7 +478,13 @@ def parse_telegram_message(message):
             data['wife_mood'] = wife_mood_match.group(1).strip()
         else:
             data['wife_mood'] = None
-
+        
+        health_match = re.search(patterns.get('health', ''), message)
+        if health_match:
+            data['health'] = health_match.group(1).strip()
+        else:
+            data['health'] = None
+        
         # Извлечение привычек с отметкой ✅
         habits_section = re.search(patterns.get('habits_section', ''), message)
         if habits_section:
