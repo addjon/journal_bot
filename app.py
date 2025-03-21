@@ -67,8 +67,11 @@ def webhook():
             
             # Отправляем подтверждение в Telegram
             confirmation_message = "Данные успешно обработаны и сохранены."
-            #full_message = f"{confirmation_message}\n\n{tasks_message}"
-            send_telegram_message(chat_id, confirmation_message)
+            weekly_summary = get_weekly_habits_summary()
+            goals_summary = get_goals_progress_summary()
+
+            full_message = f"{confirmation_message}\n\n{weekly_summary}\n\n{goals_summary}"    
+            send_telegram_message(chat_id, full_message)
         else:
             # Обрабатываем ошибку парсинга
             error_message = "Не удалось извлечь необходимые данные из сообщения."
@@ -267,6 +270,231 @@ def create_file_in_google_drive(content, date):
     except Exception as e:
         logging.error(f"Ошибка при создании файла на Google Диске: {e}")
 
+def get_goals_progress_summary():
+    """
+    Считывает последние 14 строк с листа «Прогресс по целям» (столбец A – дата, столбцы B..H – цели),
+    разбивает на 2 блока по 7 строк: «предыдущие 7 дней» и «последние 7 дней».
+    Для каждой цели вычисляет разницу (последнее - первое) в каждом блоке и возвращает
+    человекочитаемую сводку вида:
+      Цель по сербскому: последние 7 дней +0.1% / предыдущие 7 дней +0.2%
+    """
+    try:
+        creds = get_google_credentials()
+        if not creds:
+            return "Ошибка: не удалось получить учетные данные Google."
+
+        service_sheets = build('sheets', 'v4', credentials=creds)
+        spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
+        sheet_name = 'Прогресс по целям'
+
+        # Список целей, соответствующих столбцам B..H (или столько, сколько у вас есть)
+        # Предполагаем, что вы храните их в config.json:
+        all_goals = config.get('all_goals_for_progress', [])
+        # Если вы используете тот же список, что и в update_goals_google_sheet,
+        # где "all_goals" = [ 'Финансовая цель', 'Бизнес цель', ... ],
+        # замените строку выше на:
+        # all_goals = [
+        #     'Финансовая цель', 'Бизнес цель', 'Семейная цель',
+        #     'Цель по английскому', 'Цель по сербскому',
+        #     'Цель обучения PM', 'Цель по физической форме'
+        # ]
+
+        # 1) Определяем, сколько вообще строк занято в столбце A
+        colA_range = f"{sheet_name}!A2:A"
+        colA_data = (service_sheets.spreadsheets()
+                     .values()
+                     .get(spreadsheetId=spreadsheet_id, range=colA_range)
+                     .execute()
+                     .get('values', []))
+        num_rows = len(colA_data)  # сколько реально есть строк данных
+
+        if num_rows < 2:
+            # Если строк совсем мало, нет смысла выдавать статистику
+            return "Недостаточно данных для расчёта прогресса по целям."
+
+        # 2) Выберем максимум последние 14 строк. Если у нас меньше 14, берём сколько есть
+        # (но для «предыдущих 7 дней» нужно хотя бы 7)
+        last_row = num_rows + 1  # реальный последний индекс строки (учитывая что начинаем с A2)
+        first_row = max(2, last_row - 14 + 1)  # если 14 строк есть, берём их все, иначе сколько возможно
+
+        # Диапазон, куда входят столбцы B.. (B + len(all_goals)-1)
+        # Предположим, что у нас 7 целей (B..H). Если у вас 7 целей – это B..H,
+        # если 8 целей – это B..I, и т.д.
+        #
+        # Ниже, для примера, возьмём столбцы B..H. Если количество целей = 7, то
+        # B..(B+7-1) = B..H
+        # Вы можете построить буквы столбцов программно, но чтобы не усложнять,
+        # предположим, что у вас действительно 7 целей => B..H
+        # Если у вас реальное число целей отличается – подберите диапазон под них
+        start_col = "B"
+        end_col = chr(ord("B") + len(all_goals) - 1)  # вычисляем букву последнего столбца
+        read_range = f"{sheet_name}!{start_col}{first_row}:{end_col}{last_row}"
+
+        result_data = (service_sheets.spreadsheets()
+                       .values()
+                       .get(spreadsheetId=spreadsheet_id, range=read_range)
+                       .execute()
+                       .get('values', []))
+
+        # Теперь result_data – список списков, где каждая вложенная строка – это одна строка в листе
+        # Длина result_data = реальное количество выбранных строк (до 14)
+
+        if not result_data:
+            return "Нет данных в выбранном диапазоне для целей."
+
+        # 3) Нормализуем строки до 14 штук (или меньше, если меньше данных),
+        #    чтобы удобно было делить на 2 блока
+        #    - block1: предыдущие 7 строк
+        #    - block2: последние 7 строк
+        # Если есть, скажем, 10 строк, тогда block1 = первые 3 (из 10-7=3),
+        # а block2 = последние 7. Здесь можно сделать разные подходы.
+        # ПРОЩЕ: если строк >= 14, возьмём ровно 14, иначе возьмём всё, но делим как сможем.
+
+        total_rows = len(result_data)  # это сколько реально отдали
+        if total_rows < 7:
+            # Совсем мало. Выдадим хотя бы "мало данных"
+            return "Недостаточно строк для анализа прогресса (меньше 7)."
+
+        # Разбиваем:
+        # block2 = последние 7
+        # block1 = предыдущие (total_rows-7), но не более 7
+        block2 = result_data[-7:]  # последние 7
+        block1 = result_data[:-7]  # всё, что осталось до последних 7
+        if len(block1) > 7:
+            # Если там больше 7, значит мы взяли слишком много, урежем до 7
+            block1 = block1[-7:]
+
+        # Теперь block1 и block2 – это списки по 0..7 строк (если не хватает, может быть меньше)
+        if not block1:
+            # Если вообще нет "предыдущих" 7 дней, тогда покажем только последние 7
+            return "Недостаточно строк для предыдущих 7 дней. Отображаем только последние 7 дней."
+
+        # 4) Для каждой цели (каждого столбца) берём:
+        #    - разницу в block2 = (последняя строка block2 - первая)
+        #    - разницу в block1 = (последняя строка block1 - первая)
+        #    Индекс столбца совпадает с порядком в all_goals
+
+        # Если у нас N целей, у каждой строки row есть row[col_idx], где col_idx в [0..N-1]
+        summary_lines = []
+        for goal_idx, goal_name in enumerate(all_goals):
+            try:
+                # Берём значения block1
+                # block1[0][goal_idx] = прогресс в начале блока
+                # block1[-1][goal_idx] = прогресс в конце блока
+                # Аналогично block2
+                # Нужно аккуратно преобразовать строку в float (если там '45.3' или '45,3', раз поменяем ',' -> '.')
+                def to_float(val):
+                    if not val:
+                        return 0.0
+                    val = val.replace(',', '.').strip()
+                    return float(val)
+
+                old_start = to_float(block1[0][goal_idx])   if len(block1[0]) > goal_idx else 0.0
+                old_end   = to_float(block1[-1][goal_idx])  if len(block1[-1]) > goal_idx else 0.0
+                new_start = to_float(block2[0][goal_idx])   if len(block2[0]) > goal_idx else 0.0
+                new_end   = to_float(block2[-1][goal_idx])  if len(block2[-1]) > goal_idx else 0.0
+
+                old_diff = (old_end - old_start)
+                new_diff = (new_end - new_start)
+
+                # Формируем красивую строку:
+                # "Цель по сербскому: последние 7 дней +0.1% / предыдущие 7 дней +0.2%"
+                line = (f"{goal_name}: тек. 7 д. {format_diff(new_diff)} / "
+                        f"пред. {format_diff(old_diff)}")
+                summary_lines.append(line)
+
+            except Exception as e:
+                # Если вдруг ошибка с пустыми данными, всё равно что-то выводим
+                summary_lines.append(f"{goal_name}: нет данных для вычисления")
+
+        summary_text = "\n".join(summary_lines)
+        return summary_text
+
+    except Exception as e:
+        logging.error(f"Ошибка при формировании сводки целей: {e}")
+        return "Ошибка при формировании сводки целей."
+
+
+def format_diff(value):
+    """
+    Вспомогательная функция: принимает float,
+    возвращает строку с +0.2% или -1.3% (с учётом знака).
+    """
+    sign = "+" if value >= 0 else ""
+    # Округлим до 2 знаков после запятой или как вам нужно
+    return f"{sign}{round(value, 2)}%"
+
+
+def get_weekly_habits_summary():
+    """
+    Читает столбец A (даты) для определения последней заполненной строки,
+    затем берет диапазон B..I, формирует сводку в виде:
+      Зарядка ❌❌
+      Кегель ✅❌
+      ...
+    и возвращает эту строку для отправки в Telegram.
+    """
+    try:
+        creds = get_google_credentials()
+        if not creds:
+            return "Ошибка: нет учетных данных Google."
+        
+        service_sheets = build('sheets', 'v4', credentials=creds)
+        spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
+        sheet_name = 'Привычки-неделя'
+
+        all_habits = config.get('all_habits', [])
+
+        # 1) Определяем, сколько строк занято в столбце A, начиная с A2
+        colA_range = f"{sheet_name}!A2:A"
+        colA_data = (
+            service_sheets.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=colA_range)
+            .execute()
+            .get('values', [])
+        )
+        num_rows = len(colA_data)  # Кол-во заполненных строк по датам
+
+        if num_rows == 0:
+            return "Пока нет данных за эту неделю."
+
+        # 2) Формируем диапазон B..I до последней заполненной строки
+        last_row = 2 + num_rows - 1
+        habits_range = f"{sheet_name}!B2:I{last_row}"
+        habits_values = (
+            service_sheets.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=habits_range)
+            .execute()
+            .get('values', [])
+        )
+
+        if not habits_values:
+            return "Нет данных в столбцах B–I."
+
+        # habits_values[день][индекс_привычки]
+        lines = []
+        for habit_idx, habit_name in enumerate(all_habits):
+            day_statuses = []
+            for day_idx in range(len(habits_values)):
+                row = habits_values[day_idx]
+                if habit_idx < len(row) and row[habit_idx] == '✔':
+                    day_statuses.append('✅')
+                else:
+                    day_statuses.append('❌')
+            # Собираем строку вида "Зарядка ❌❌"
+            line_str = f"{habit_name} {''.join(day_statuses)}"
+            lines.append(line_str)
+
+        summary_text = "\n".join(lines)
+        return summary_text
+
+    except Exception as e:
+        logging.error(f"Ошибка при формировании сводки привычек: {e}")
+        return "Ошибка при формировании сводки привычек."
+
+
 def update_habits_google_sheet(parsed_data):
     try:
         # Получение учетных данных через отдельную функцию
@@ -284,7 +512,7 @@ def update_habits_google_sheet(parsed_data):
         sheet_name = 'Привычки-неделя'
 
         # Список всех ваших привычек
-        all_habits = ['Зарядка', 'Кегель', 'Стоицизм', 'Чтение', 'Сербский', 'Трекер работы', 'Английский', 'Запись в дневник']
+        all_habits = config.get('all_habits', [])
 
         # Подготовка данных о выполненных привычках
         habits_checked = parsed_data.get('habits_checked', [])
@@ -340,11 +568,12 @@ def update_goals_google_sheet(parsed_data):
         sheet_name = 'Прогресс по целям'
 
         # Список всех целей
-        all_goals = [
-            'Финансовая цель', 'Бизнес цель', 'Семейная цель', 
-            'Цель по английскому', 'Цель по сербскому', 
-            'Цель обучения PM', 'Цель по физической форме'
-        ]
+        all_goals = config.get('all_goals_for_progress', [])
+#        all_goals = [
+#            'Финансовая цель', 'Бизнес цель', 'Семейная цель', 
+#            'Цель по английскому', 'Цель по сербскому', 
+#            'Цель обучения PM', 'Цель по физической форме'
+#        ]
 
         # Подготовка данных по процентам выполнения целей
         goals = parsed_data.get('goals', {})
