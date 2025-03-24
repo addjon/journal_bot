@@ -399,8 +399,8 @@ def get_goals_progress_summary():
 
                 # Формируем красивую строку:
                 # "Цель по сербскому: последние 7 дней +0.1% / предыдущие 7 дней +0.2%"
-                line = (f"{goal_name}: тек. 7 д. {format_diff(new_diff)} / "
-                        f"пред. {format_diff(old_diff)}")
+                line = (f"{goal_name}: {format_diff(new_diff)} / "
+                        f"({format_diff(old_diff)})")
                 summary_lines.append(line)
 
             except Exception as e:
